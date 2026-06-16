@@ -1,0 +1,377 @@
+"""
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import (
+    f1_score, precision_score, recall_score, roc_auc_score,
+    confusion_matrix, classification_report, roc_curve, precision_recall_curve
+)
+from sklearn.pipeline import Pipeline
+import warnings
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+# 1. SYNTHETIC DATASET GENERATION
+# ─────────────────────────────────────────────
+np.random.seed(42)
+N = 5000
+
+def generate_dataset(n):
+    # Demographics
+    age = np.random.randint(21, 70, n)
+    employment_years = np.clip(np.random.normal(7, 5, n), 0, 40).astype(int)
+
+    # Income (correlated with age/employment)
+    base_income = 25000 + age * 800 + employment_years * 1200
+    income = np.random.normal(base_income, 15000, n).clip(15000, 300000)
+
+    # Debt
+    total_debt = np.random.exponential(scale=income * 0.35, size=n).clip(0, 500000)
+    monthly_emi = total_debt / np.random.randint(12, 84, n)
+
+    # Payment history (0–100 score; higher = better)
+    payment_history = np.random.beta(5, 2, n) * 100
+
+    # Credit utilization (0–100%)
+    credit_limit = np.random.uniform(10000, 150000, n)
+    credit_used = credit_limit * np.random.beta(2, 4, n)
+    credit_utilization = (credit_used / credit_limit) * 100
+
+    # Number of open accounts
+    num_open_accounts = np.random.randint(1, 15, n)
+
+    # Number of late payments (last 2 years)
+    late_payments = np.random.choice([0, 1, 2, 3, 4, 5], n, p=[0.50, 0.22, 0.12, 0.08, 0.05, 0.03])
+
+    # Number of hard inquiries (last 6 months)
+    hard_inquiries = np.random.choice([0, 1, 2, 3, 4], n, p=[0.45, 0.30, 0.15, 0.07, 0.03])
+
+    # Loan purpose
+    loan_purpose = np.random.choice(
+        ['Home', 'Auto', 'Education', 'Personal', 'Business'],
+        n, p=[0.30, 0.25, 0.15, 0.20, 0.10]
+    )
+
+    # Existing loans
+    num_existing_loans = np.random.choice([0, 1, 2, 3, 4], n, p=[0.25, 0.35, 0.25, 0.10, 0.05])
+
+    # Savings balance
+    savings = np.random.exponential(scale=income * 0.2, size=n).clip(0, 500000)
+
+    # Debt-to-Income Ratio
+    dti = (monthly_emi / (income / 12)) * 100
+
+    # ── CREDIT SCORE (300–850) ──────────────────
+    score = (
+        payment_history * 1.5
+        - credit_utilization * 0.6
+        + (income / 10000) * 2.5
+        - dti * 0.8
+        + employment_years * 1.2
+        - late_payments * 12
+        - hard_inquiries * 5
+        + savings / 5000
+        + num_open_accounts * 1.5
+        - total_debt / 8000
+        + age * 0.3
+    )
+    # Normalize to 300–850
+    score = 300 + (score - score.min()) / (score.max() - score.min()) * 550
+    score = score + np.random.normal(0, 10, n)
+    score = np.clip(score, 300, 850).astype(int)
+
+    # ── TARGET: Creditworthy? (1 = Yes, 0 = No) ─
+    # Rule: score >= 650 AND dti < 50 AND late_payments <= 2
+    creditworthy = ((score >= 650) & (dti < 50) & (late_payments <= 2)).astype(int)
+    # Add 3% noise
+    noise_idx = np.random.choice(n, size=int(0.03 * n), replace=False)
+    creditworthy[noise_idx] = 1 - creditworthy[noise_idx]
+
+    df = pd.DataFrame({
+        'Age': age,
+        'Employment_Years': employment_years,
+        'Annual_Income': income.round(2),
+        'Total_Debt': total_debt.round(2),
+        'Monthly_EMI': monthly_emi.round(2),
+        'Payment_History_Score': payment_history.round(2),
+        'Credit_Utilization_Pct': credit_utilization.round(2),
+        'Credit_Limit': credit_limit.round(2),
+        'Num_Open_Accounts': num_open_accounts,
+        'Late_Payments_2yr': late_payments,
+        'Hard_Inquiries_6mo': hard_inquiries,
+        'Num_Existing_Loans': num_existing_loans,
+        'Savings_Balance': savings.round(2),
+        'Debt_To_Income_Ratio': dti.round(2),
+        'Loan_Purpose': loan_purpose,
+        'Credit_Score': score,
+        'Creditworthy': creditworthy
+    })
+    return df
+
+df = generate_dataset(N)
+print("=" * 60)
+print("CREDIT SCORE MODELING — DATASET SUMMARY")
+print("=" * 60)
+print(f"\nDataset shape : {df.shape}")
+print(f"Creditworthy  : {df['Creditworthy'].sum()} ({df['Creditworthy'].mean()*100:.1f}%)")
+print(f"Non-creditworthy: {(df['Creditworthy']==0).sum()} ({(1-df['Creditworthy'].mean())*100:.1f}%)")
+print("\nFirst 5 rows:")
+print(df.head().to_string(index=False))
+print("\nDescriptive Statistics:")
+print(df.describe().round(2).to_string())
+
+# ─────────────────────────────────────────────
+# 2. FEATURE ENGINEERING & PREPROCESSING
+# ─────────────────────────────────────────────
+# Encode loan purpose
+le = LabelEncoder()
+df['Loan_Purpose_Enc'] = le.fit_transform(df['Loan_Purpose'])
+
+# Feature columns
+FEATURES = [
+    'Age', 'Employment_Years', 'Annual_Income', 'Total_Debt',
+    'Monthly_EMI', 'Payment_History_Score', 'Credit_Utilization_Pct',
+    'Num_Open_Accounts', 'Late_Payments_2yr', 'Hard_Inquiries_6mo',
+    'Num_Existing_Loans', 'Savings_Balance', 'Debt_To_Income_Ratio',
+    'Credit_Score', 'Loan_Purpose_Enc'
+]
+TARGET = 'Creditworthy'
+
+X = df[FEATURES]
+y = df[TARGET]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+print(f"\nTrain size: {X_train.shape[0]} | Test size: {X_test.shape[0]}")
+
+# ─────────────────────────────────────────────
+# 3. MODEL TRAINING
+# ─────────────────────────────────────────────
+models = {
+    'Logistic Regression': Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', LogisticRegression(max_iter=1000, random_state=42))
+    ]),
+    'Random Forest': RandomForestClassifier(
+        n_estimators=150, max_depth=10, random_state=42, n_jobs=-1
+    ),
+    'Gradient Boosting': GradientBoostingClassifier(
+        n_estimators=150, learning_rate=0.1, max_depth=5, random_state=42
+    )
+}
+
+results = {}
+print("\n" + "=" * 60)
+print("MODEL EVALUATION RESULTS")
+print("=" * 60)
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    f1       = f1_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall   = recall_score(y_test, y_pred)
+    roc_auc  = roc_auc_score(y_test, y_prob)
+    cm       = confusion_matrix(y_test, y_pred)
+
+    # Cross-val F1
+    cv_f1 = cross_val_score(model, X, y, cv=5, scoring='f1').mean()
+
+    results[name] = {
+        'model': model, 'y_pred': y_pred, 'y_prob': y_prob,
+        'f1': f1, 'precision': precision, 'recall': recall,
+        'roc_auc': roc_auc, 'cm': cm, 'cv_f1': cv_f1
+    }
+
+    print(f"\n{'─'*40}")
+    print(f"  {name}")
+    print(f"{'─'*40}")
+    print(f"  Precision        : {precision:.4f}")
+    print(f"  Recall           : {recall:.4f}")
+    print(f"  F1 Score         : {f1:.4f}")
+    print(f"  ROC-AUC          : {roc_auc:.4f}")
+    print(f"  CV F1 (5-fold)   : {cv_f1:.4f}")
+    print(f"\n  Classification Report:")
+    report = classification_report(y_test, y_pred,
+          target_names=['Non-Creditworthy', 'Creditworthy'])
+    print("    " + report.replace('\n', '\n    '))
+
+# ─────────────────────────────────────────────
+# 4. FEATURE IMPORTANCE (Random Forest)
+# ─────────────────────────────────────────────
+rf_model = results['Random Forest']['model']
+feat_imp = pd.Series(rf_model.feature_importances_, index=FEATURES).sort_values(ascending=False)
+
+# ─────────────────────────────────────────────
+# 5. VISUALIZATION — 3×3 DASHBOARD
+# ─────────────────────────────────────────────
+plt.style.use('seaborn-v0_8-whitegrid')
+PALETTE = {'pos': '#2ecc71', 'neg': '#e74c3c', 'neutral': '#3498db',
+           'warn': '#f39c12', 'dark': '#2c3e50', 'light': '#ecf0f1'}
+
+fig = plt.figure(figsize=(22, 18))
+fig.patch.set_facecolor('#1a1a2e')
+gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+TITLE_KW = dict(fontsize=12, fontweight='bold', color='white', pad=10)
+TICK_KW  = dict(colors='#cccccc', labelsize=9)
+
+def style_ax(ax, title):
+    ax.set_facecolor('#16213e')
+    ax.set_title(title, **TITLE_KW)
+    ax.tick_params(axis='both', **TICK_KW)
+    ax.xaxis.label.set_color('#aaaaaa')
+    ax.yaxis.label.set_color('#aaaaaa')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#333355')
+
+# ── 1. Target Distribution ──────────────────
+ax1 = fig.add_subplot(gs[0, 0])
+counts = df['Creditworthy'].value_counts()
+bars = ax1.bar(['Non-Creditworthy', 'Creditworthy'], counts.values,
+               color=[PALETTE['neg'], PALETTE['pos']], edgecolor='white', linewidth=0.7)
+for b, v in zip(bars, counts.values):
+    ax1.text(b.get_x() + b.get_width()/2, b.get_height() + 30,
+             f'{v}\n({v/N*100:.1f}%)', ha='center', va='bottom',
+             color='white', fontsize=9, fontweight='bold')
+style_ax(ax1, '① Class Distribution')
+ax1.set_ylabel('Count')
+
+# ── 2. Credit Score Distribution ────────────
+ax2 = fig.add_subplot(gs[0, 1])
+ax2.hist(df[df['Creditworthy']==0]['Credit_Score'], bins=40,
+         alpha=0.75, color=PALETTE['neg'], label='Non-Creditworthy', edgecolor='none')
+ax2.hist(df[df['Creditworthy']==1]['Credit_Score'], bins=40,
+         alpha=0.75, color=PALETTE['pos'], label='Creditworthy', edgecolor='none')
+ax2.axvline(650, color=PALETTE['warn'], linestyle='--', linewidth=1.5, label='Threshold 650')
+ax2.legend(fontsize=8, facecolor='#16213e', labelcolor='white')
+style_ax(ax2, '② Credit Score Distribution')
+ax2.set_xlabel('Credit Score')
+ax2.set_ylabel('Frequency')
+
+# ── 3. Metrics Comparison Bar Chart ─────────
+ax3 = fig.add_subplot(gs[0, 2])
+metric_names = ['Precision', 'Recall', 'F1 Score', 'ROC-AUC']
+model_names  = list(results.keys())
+x = np.arange(len(metric_names))
+w = 0.25
+colors = ['#3498db', '#e67e22', '#9b59b6']
+for i, (mname, c) in enumerate(zip(model_names, colors)):
+    vals = [results[mname]['precision'], results[mname]['recall'],
+            results[mname]['f1'], results[mname]['roc_auc']]
+    bars = ax3.bar(x + i*w, vals, w, label=mname, color=c, alpha=0.85)
+ax3.set_xticks(x + w)
+ax3.set_xticklabels(metric_names, fontsize=8, color='#cccccc')
+ax3.set_ylim(0, 1.1)
+ax3.axhline(1.0, color='#555', linewidth=0.5, linestyle='--')
+ax3.legend(fontsize=7, facecolor='#16213e', labelcolor='white')
+style_ax(ax3, '③ Model Metrics Comparison')
+ax3.set_ylabel('Score')
+
+# ── 4–6. Confusion Matrices ─────────────────
+for idx, (mname, mres) in enumerate(results.items()):
+    ax = fig.add_subplot(gs[1, idx])
+    cm = mres['cm']
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Non-CW', 'CW'], yticklabels=['Non-CW', 'CW'],
+                ax=ax, linewidths=0.5, cbar=False,
+                annot_kws={'size': 13, 'weight': 'bold', 'color': 'white'})
+    ax.set_facecolor('#16213e')
+    ax.set_title(f'④⑤⑥ CM — {mname}', **TITLE_KW)
+    ax.tick_params(**TICK_KW)
+    ax.set_xlabel('Predicted', color='#aaaaaa', fontsize=9)
+    ax.set_ylabel('Actual', color='#aaaaaa', fontsize=9)
+
+# ── 7. ROC Curves ───────────────────────────
+ax7 = fig.add_subplot(gs[2, 0])
+colors = ['#3498db', '#e67e22', '#9b59b6']
+for (mname, mres), c in zip(results.items(), colors):
+    fpr, tpr, _ = roc_curve(y_test, mres['y_prob'])
+    ax7.plot(fpr, tpr, color=c, lw=2, label=f"{mname} (AUC={mres['roc_auc']:.3f})")
+ax7.plot([0,1],[0,1], 'w--', lw=1, alpha=0.5)
+ax7.set_xlim([0,1]); ax7.set_ylim([0,1.02])
+ax7.legend(fontsize=7.5, facecolor='#16213e', labelcolor='white')
+style_ax(ax7, '⑦ ROC Curves')
+ax7.set_xlabel('False Positive Rate')
+ax7.set_ylabel('True Positive Rate')
+
+# ── 8. Feature Importances ──────────────────
+ax8 = fig.add_subplot(gs[2, 1])
+feat_colors = [PALETTE['pos'] if v > feat_imp.mean() else PALETTE['neutral']
+               for v in feat_imp.values]
+ax8.barh(feat_imp.index[::-1], feat_imp.values[::-1],
+         color=feat_colors[::-1], edgecolor='none')
+style_ax(ax8, '⑧ Feature Importances (RF)')
+ax8.set_xlabel('Importance Score')
+ax8.tick_params(axis='y', labelsize=7.5)
+
+# ── 9. Cross-val F1 Comparison ──────────────
+ax9 = fig.add_subplot(gs[2, 2])
+cv_vals = [results[m]['cv_f1'] for m in model_names]
+bars = ax9.bar(model_names, cv_vals, color=colors, edgecolor='white', linewidth=0.7)
+for b, v in zip(bars, cv_vals):
+    ax9.text(b.get_x() + b.get_width()/2, v + 0.005,
+             f'{v:.4f}', ha='center', va='bottom', color='white',
+             fontsize=10, fontweight='bold')
+ax9.set_ylim(0, 1.1)
+style_ax(ax9, '⑨ Cross-Val F1 (5-Fold)')
+ax9.set_ylabel('F1 Score')
+ax9.tick_params(axis='x', labelsize=8)
+
+# ── Main Title ──────────────────────────────
+fig.suptitle('CREDIT SCORE MODELING — CREDITWORTHINESS ASSESSMENT DASHBOARD',
+             fontsize=16, fontweight='bold', color='white', y=0.98)
+
+plt.savefig('/mnt/user-data/outputs/credit_score_dashboard.png',
+            dpi=150, bbox_inches='tight', facecolor='#1a1a2e')
+print("\n✅ Dashboard saved to outputs.")
+
+# ─────────────────────────────────────────────
+# 6. SINGLE APPLICANT PREDICTION DEMO
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("DEMO: PREDICT CREDITWORTHINESS FOR A NEW APPLICANT")
+print("=" * 60)
+
+applicant = pd.DataFrame([{
+    'Age': 34,
+    'Employment_Years': 8,
+    'Annual_Income': 75000,
+    'Total_Debt': 22000,
+    'Monthly_EMI': 4500,
+    'Payment_History_Score': 82,
+    'Credit_Utilization_Pct': 28,
+    'Num_Open_Accounts': 5,
+    'Late_Payments_2yr': 1,
+    'Hard_Inquiries_6mo': 1,
+    'Num_Existing_Loans': 2,
+    'Savings_Balance': 18000,
+    'Debt_To_Income_Ratio': 28.5,
+    'Credit_Score': 712,
+    'Loan_Purpose_Enc': le.transform(['Home'])[0]
+}])
+
+best_model = results['Gradient Boosting']['model']
+pred = best_model.predict(applicant)[0]
+prob = best_model.predict_proba(applicant)[0][1]
+
+print(f"\n  Applicant Profile:")
+print(f"    Age              : 34 | Employment: 8 yrs")
+print(f"    Annual Income    : ₹75,000 | Debt: ₹22,000")
+print(f"    Credit Score     : 712 | DTI: 28.5%")
+print(f"    Payment History  : 82/100 | Late Payments: 1")
+print(f"\n  ➤ Creditworthy     : {'✅ YES' if pred == 1 else '❌ NO'}")
+print(f"  ➤ Probability      : {prob:.2%}")
+print(f"  ➤ Risk Level       : {'Low' if prob > 0.75 else 'Medium' if prob > 0.5 else 'High'}")
+print("\n✅ Done.")
